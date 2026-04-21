@@ -135,11 +135,16 @@ export function ConnectionPanel({ title, subtitle, value, onChange }: Props) {
           <label className="text-xs font-medium text-slate-300 mb-1 block">
             PostgreSQL Connection String
           </label>
+          <p className="text-[11px] text-amber-300/90 mb-1.5">
+            Use the <span className="font-semibold">Transaction pooler</span> string from Supabase
+            (Project Settings → Database → Connection string). Direct connection won&apos;t work on
+            Vercel / serverless (IPv6 only).
+          </p>
           <div className="relative">
             <input
               type={showPg ? "text" : "password"}
               className="sm-input pr-20 font-mono"
-              placeholder="postgres://postgres:...@db.xxxx.supabase.co:5432/postgres"
+              placeholder="postgresql://postgres.xxxx:...@aws-0-<region>.pooler.supabase.com:6543/postgres"
               value={value.connectionString}
               onChange={(e) => onChange({ ...value, connectionString: e.target.value })}
               autoComplete="off"
@@ -160,7 +165,7 @@ export function ConnectionPanel({ title, subtitle, value, onChange }: Props) {
             )}`}
           >
             {value.connectionString.length === 0
-              ? "Required — direct pooled/session string"
+              ? "Required — use the Transaction pooler URI (port 6543)"
               : pgOk
               ? "Looks good"
               : "Must start with postgres://"}
