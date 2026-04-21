@@ -83,3 +83,32 @@ export function quoteLiteral(value: unknown): string {
   const s = String(value).replace(/'/g, "''");
   return `'${s}'`;
 }
+
+// ─── Human-readable error messages ───────────────────────────────────────────
+
+export function friendlyPgError(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code === "ENOTFOUND") {
+    return (
+      `DNS resolution failed — host not found. ` +
+      `You must use the Supabase connection pooler URL, not the direct DB host. ` +
+      `In Supabase Dashboard go to: Project Settings → Database → Connection pooling, ` +
+      `copy the Session mode URL (port 5432) and use that as your connection string.`
+    );
+  }
+  if (code === "ECONNREFUSED") {
+    return (
+      `Connection refused on port 5432. ` +
+      `Your environment likely blocks direct PostgreSQL connections. ` +
+      `Use the Supabase pooler URL instead (Dashboard → Project Settings → Database → Connection pooling).`
+    );
+  }
+  if (code === "ETIMEDOUT") {
+    return (
+      `Connection timed out. The host is unreachable from this environment. ` +
+      `Try the Supabase pooler URL (Dashboard → Project Settings → Database → Connection pooling).`
+    );
+  }
+  return err.message;
+}

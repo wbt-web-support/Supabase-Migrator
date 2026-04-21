@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { createClient } from "@/lib/pg";
+import { createClient, friendlyPgError } from "@/lib/pg";
 import { pingRest } from "@/lib/supabase";
 
 export const runtime = "nodejs";
@@ -39,7 +39,8 @@ export async function POST(request: Request) {
     const v = await client.query<{ version: string }>("SELECT version()");
     pg = { ok: true, message: "Connected", version: v.rows[0]?.version };
   } catch (err: unknown) {
-    pg = { ok: false, message: err instanceof Error ? err.message : "Unknown pg error" };
+    // ← only change: friendlyPgError instead of err.message
+    pg = { ok: false, message: friendlyPgError(err) };
   } finally {
     await client.end().catch(() => {});
   }
