@@ -262,6 +262,27 @@ export function buildCreateTableStatement(t: TableInfo): string {
   return `CREATE TABLE IF NOT EXISTS ${quoteQualified(t.schema, t.name)} (\n${cols.join(",\n")}\n);`;
 }
 
+export function buildAddPrimaryKeyStatement(schema: string, table: string, pkColumns: string[]): string {
+  if (pkColumns.length === 0) return "";
+  const constraintName = `${table}_pkey`;
+  return `DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint c
+    JOIN pg_class cl ON cl.oid = c.conrelid
+    JOIN pg_namespace n ON n.oid = cl.relnamespace
+    WHERE c.contype = 'p'
+      AND n.nspname = ${quoteLiteral(schema)}
+      AND cl.relname = ${quoteLiteral(table)}
+  ) THEN
+    ALTER TABLE ${quoteQualified(schema, table)}
+    ADD CONSTRAINT ${quoteIdent(constraintName)}
+    PRIMARY KEY (${pkColumns.map(quoteIdent).join(", ")});
+  END IF;
+END $$;`;
+}
+
 type PreviewOutput = {
   sql: string;
   plan: Array<{ qualifiedName: string; estimatedRows: number; sizeBytes: number; warnings: string[] }>;

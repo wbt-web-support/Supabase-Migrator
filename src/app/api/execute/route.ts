@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { createClient, createPool, quoteQualified, quoteIdent } from "@/lib/pg";
 import {
+  buildAddPrimaryKeyStatement,
   buildCreateTableStatement,
   buildInsertSql,
   buildSelectSql,
@@ -155,7 +156,13 @@ export async function POST(request: Request) {
             if (config.objectTypes.tables) {
               let ok = 0;
               for (const t of selectedTables) {
-                if (await runStmt(buildCreateTableStatement(t), `table ${t.schema}.${t.name}`)) ok += 1;
+                const created = await runStmt(buildCreateTableStatement(t), `table ${t.schema}.${t.name}`);
+                const pk = await fetchPrimaryKey(srcClient, t.schema, t.name).catch(() => []);
+                if (pk.length) {
+                  const addPk = buildAddPrimaryKeyStatement(t.schema, t.name, pk);
+                  await runStmt(addPk, `primary key ${t.schema}.${t.name}`);
+                }
+                if (created) ok += 1;
               }
               send({ type: "log", message: `Tables: ${ok}/${selectedTables.length} created` });
             }
@@ -388,7 +395,23 @@ async function streamTable(
     if (page.rows.length === 0) break;
 
     const insertSql = buildInsertSql(t, page.rows, config.conflictStrategy, pk);
-    if (insertSql) await dstClient.query(insertSql);
+    if (insertSql) {
+      try {
+        await dstClient.query(insertSql);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (
+          (config.conflictStrategy === "SKIP" || config.conflictStrategy === "UPSERT") &&
+          msg.includes("no unique or exclusion constraint matching the ON CONFLICT specification")
+        ) {
+          // Fallback for targets missing PK/UNIQUE constraints: insert rows without ON CONFLICT.
+          const plainInsertSql = buildInsertSql(t, page.rows, "OVERWRITE", pk);
+          if (plainInsertSql) await dstClient.query(plainInsertSql);
+        } else {
+          throw err;
+        }
+      }
+    }
 
     rowsCopied += page.rows.length;
     onProgress(rowsCopied);

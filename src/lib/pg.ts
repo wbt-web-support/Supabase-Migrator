@@ -89,6 +89,7 @@ export function quoteLiteral(value: unknown): string {
 export function friendlyPgError(err: unknown): string {
   if (!(err instanceof Error)) return String(err);
   const code = (err as NodeJS.ErrnoException).code;
+  const message = err.message.toLowerCase();
   if (code === "ENOTFOUND") {
     return (
       `DNS resolution failed — host not found. ` +
@@ -108,6 +109,13 @@ export function friendlyPgError(err: unknown): string {
     return (
       `Connection timed out. The host is unreachable from this environment. ` +
       `Try the Supabase pooler URL (Dashboard → Project Settings → Database → Connection pooling).`
+    );
+  }
+  if (message.includes("timeout expired") || message.includes("connection timeout")) {
+    return (
+      `Postgres connection timed out. ` +
+      `Use the Supabase transaction/session pooler URI (host containing ".pooler.supabase.", usually port 6543), ` +
+      `not the direct DB host.`
     );
   }
   return err.message;
