@@ -283,6 +283,13 @@ BEGIN
 END $$;`;
 }
 
+export function buildCreatePrimaryKeyStatement(schema: string, table: string, pkColumns: string[]): string {
+  if (pkColumns.length === 0) return "";
+  return `ALTER TABLE ${quoteQualified(schema, table)} ADD CONSTRAINT ${quoteIdent(
+    `${table}_pkey`
+  )} PRIMARY KEY (${pkColumns.map(quoteIdent).join(", ")});`;
+}
+
 type PreviewOutput = {
   sql: string;
   plan: Array<{ qualifiedName: string; estimatedRows: number; sizeBytes: number; warnings: string[] }>;

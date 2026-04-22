@@ -18,6 +18,7 @@ export default function PreviewPage() {
   const router = useRouter();
   const { source, destination, config, preview, setPreview, setConfig } = useMigrator();
   const [loading, setLoading] = useState(false);
+  const [downloadingBackup, setDownloadingBackup] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -68,6 +69,42 @@ export default function PreviewPage() {
     URL.revokeObjectURL(url);
   }
 
+  async function downloadBackup() {
+    setError(null);
+    setDownloadingBackup(true);
+    try {
+      const res = await fetch("/api/backup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source: { connectionString: source.connectionString },
+          config,
+        }),
+      });
+
+      if (!res.ok) {
+        const json = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(json?.error ?? "Backup download failed");
+      }
+
+      const blob = await res.blob();
+      const cd = res.headers.get("Content-Disposition") ?? "";
+      const match = cd.match(/filename="([^"]+)"/);
+      const fileName = match?.[1] ?? `supabase-backup-${Date.now()}.sql`;
+
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fileName;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Backup download failed");
+    } finally {
+      setDownloadingBackup(false);
+    }
+  }
+
   return (
     <div className="min-h-screen flex flex-col">
       <Stepper current={3} />
@@ -83,6 +120,9 @@ export default function PreviewPage() {
           <div className="flex gap-2">
             <button className="sm-btn" onClick={runPreview} disabled={loading}>
               {loading ? "Generating…" : "Regenerate"}
+            </button>
+            <button className="sm-btn" onClick={downloadBackup} disabled={loading || downloadingBackup}>
+              {downloadingBackup ? "Preparing backup…" : "Backup tables (.sql)"}
             </button>
             <button className="sm-btn" onClick={downloadSql} disabled={!preview}>
               Download .sql
