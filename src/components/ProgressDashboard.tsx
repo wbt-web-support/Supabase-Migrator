@@ -85,8 +85,16 @@ export function ProgressDashboard({ source, destination, config, onDone }: Props
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          source: { connectionString: source.connectionString },
-          destination: { connectionString: destination.connectionString },
+          source: {
+            connectionString: source.connectionString,
+            projectUrl: source.projectUrl,
+            serviceRoleKey: source.serviceRoleKey,
+          },
+          destination: {
+            connectionString: destination.connectionString,
+            projectUrl: destination.projectUrl,
+            serviceRoleKey: destination.serviceRoleKey,
+          },
           config,
         }),
         signal: controller.signal,

@@ -35,6 +35,7 @@ const configSchema: z.ZodType<MigrationConfig> = z.object({
     triggers: z.boolean(),
     extensions: z.boolean(),
     enums: z.boolean(),
+    storage: z.boolean(),
   }),
   conflictStrategy: z.enum(["SKIP", "UPSERT", "OVERWRITE"]),
   batchSize: z.number().int().min(1).max(10_000),

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { createClient, createPool, quoteQualified, quoteIdent } from "@/lib/pg";
+import { copySupabaseStorage } from "@/lib/storage";
 import {
   buildAddPrimaryKeyStatement,
   buildCreateTableStatement,
@@ -44,14 +45,23 @@ const configSchema = z.object({
     triggers: z.boolean(),
     extensions: z.boolean(),
     enums: z.boolean(),
+    storage: z.boolean(),
   }),
   conflictStrategy: z.enum(["SKIP", "UPSERT", "OVERWRITE"]),
   batchSize: z.number().int().min(1).max(10_000),
 });
 
 const bodySchema = z.object({
-  source: z.object({ connectionString: z.string().min(10) }),
-  destination: z.object({ connectionString: z.string().min(10) }),
+  source: z.object({
+    connectionString: z.string().min(10),
+    projectUrl: z.string().optional(),
+    serviceRoleKey: z.string().optional(),
+  }),
+  destination: z.object({
+    connectionString: z.string().min(10),
+    projectUrl: z.string().optional(),
+    serviceRoleKey: z.string().optional(),
+  }),
   config: configSchema,
 });
 
@@ -289,6 +299,33 @@ export async function POST(request: Request) {
               send({ type: "log", message: `RLS: ${ok}/${total} applied` });
             }
           });
+        }
+
+        if (config.objectTypes.storage) {
+          if (
+            !source.projectUrl ||
+            !source.serviceRoleKey ||
+            !destination.projectUrl ||
+            !destination.serviceRoleKey
+          ) {
+            send({
+              type: "log",
+              message: "Storage: skipped (missing project URL or service role key on source/destination)",
+            });
+          } else {
+            send({ type: "log", message: "Storage: starting bucket/file sync…" });
+            const storageResult = await copySupabaseStorage({
+              sourceUrl: source.projectUrl,
+              sourceServiceKey: source.serviceRoleKey,
+              destinationUrl: destination.projectUrl,
+              destinationServiceKey: destination.serviceRoleKey,
+              onLog: (message) => send({ type: "log", message }),
+            });
+            send({
+              type: "log",
+              message: `Storage: done (${storageResult.buckets} buckets, ${storageResult.files} files synced)`,
+            });
+          }
         }
 
         send({

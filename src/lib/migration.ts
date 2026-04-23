@@ -428,6 +428,11 @@ export async function generatePreview(
     parts.push("");
   }
 
+  if (config.objectTypes.storage) {
+    parts.push("-- Storage migration is executed at run time (Supabase buckets/files sync).");
+    parts.push("");
+  }
+
   for (const t of selectedTables) {
     const qn = `${t.schema}.${t.name}`;
     const w: string[] = [];

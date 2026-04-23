@@ -39,6 +39,7 @@ export type ObjectTypeFlags = {
   triggers: boolean;
   extensions: boolean;
   enums: boolean;
+  storage: boolean;
 };
 
 export type ScopeMode = "schema_and_data" | "schema_only" | "data_only";

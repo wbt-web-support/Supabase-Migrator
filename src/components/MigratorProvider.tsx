@@ -47,6 +47,7 @@ export const defaultConfig: MigrationConfig = {
     triggers: false,
     extensions: false,
     enums: true,
+    storage: false,
   },
   conflictStrategy: "SKIP",
   batchSize: 1000,

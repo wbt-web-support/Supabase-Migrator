@@ -30,6 +30,7 @@ const objectTypeLabels: Record<keyof ObjectTypeFlags, string> = {
   triggers: "Triggers",
   extensions: "Extensions",
   enums: "Enums",
+  storage: "Storage buckets/files",
 };
 
 export function FilterConfig({ config, onChange }: Props) {
