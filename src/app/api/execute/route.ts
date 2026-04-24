@@ -1,11 +1,10 @@
 import { z } from "zod";
 import { createClient, createPool, quoteQualified, quoteIdent } from "@/lib/pg";
 import { copySupabaseStorage } from "@/lib/storage";
+import { pLimit } from "@/lib/concurrency";
 import {
   buildAddPrimaryKeyStatement,
   buildCreateTableStatement,
-  buildInsertSql,
-  buildSelectSql,
   fetchExtensions,
   fetchEnums,
   fetchForeignKeys,
@@ -21,9 +20,17 @@ import {
 } from "@/lib/migration";
 import type { MigrationConfig, SSEEvent, TableInfo } from "@/lib/types";
 import type { PoolClient } from "pg";
+import { from as copyFrom, to as copyTo } from "pg-copy-streams";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+
+const TABLE_CONCURRENCY = 6;
+const SRC_POOL_SIZE = 10;
+const DST_POOL_SIZE = 20;
+const PROGRESS_INTERVAL_MS = 500;
 
 const configSchema = z.object({
   scopeMode: z.enum(["schema_and_data", "schema_only", "data_only"]),
@@ -108,8 +115,6 @@ export async function POST(request: Request) {
         }
       };
 
-      // Force an initial flush through any upstream buffers (Next.js, proxies,
-      // browser buffer thresholds) and open the event stream visibly.
       sendRaw(`: ${" ".repeat(2048)}\n\n`);
       sendRaw(`: connected\n\n`);
 
@@ -117,7 +122,8 @@ export async function POST(request: Request) {
 
       const startedAt = Date.now();
       const srcClient = createClient(source.connectionString);
-      const dstPool = createPool(destination.connectionString, 4);
+      const srcDataPool = createPool(source.connectionString, SRC_POOL_SIZE);
+      const dstPool = createPool(destination.connectionString, DST_POOL_SIZE);
 
       try {
         send({ type: "log", message: "Connecting to source database…" });
@@ -129,12 +135,24 @@ export async function POST(request: Request) {
         const selectedSchemas = Array.from(new Set(selectedTables.map((t) => t.schema)));
 
         send({ type: "start", totalTables: selectedTables.length, startedAt });
-        send({ type: "log", message: `Planning migration for ${selectedTables.length} tables` });
+        send({
+          type: "log",
+          message: `Planning migration for ${selectedTables.length} tables (parallel=${TABLE_CONCURRENCY})`,
+        });
 
         const wantSchema = config.scopeMode !== "data_only";
         const wantData = config.scopeMode !== "schema_only";
 
         if (signal.aborted) throw new AbortError();
+
+        // Pre-fetch primary keys once; used for DDL phase 1 AND data phase conflict handling.
+        const pkMap = new Map<string, string[]>();
+        if (config.objectTypes.tables) {
+          for (const t of selectedTables) {
+            const pk = await fetchPrimaryKey(srcClient, t.schema, t.name).catch(() => []);
+            pkMap.set(`${t.schema}.${t.name}`, pk);
+          }
+        }
 
         if (wantSchema) {
           await runDDL(dstPool, send, signal, async (runStmt) => {
@@ -167,7 +185,7 @@ export async function POST(request: Request) {
               let ok = 0;
               for (const t of selectedTables) {
                 const created = await runStmt(buildCreateTableStatement(t), `table ${t.schema}.${t.name}`);
-                const pk = await fetchPrimaryKey(srcClient, t.schema, t.name).catch(() => []);
+                const pk = pkMap.get(`${t.schema}.${t.name}`) ?? [];
                 if (pk.length) {
                   const addPk = buildAddPrimaryKeyStatement(t.schema, t.name, pk);
                   await runStmt(addPk, `primary key ${t.schema}.${t.name}`);
@@ -184,56 +202,70 @@ export async function POST(request: Request) {
         let totalRows = 0;
 
         if (wantData && config.objectTypes.tables) {
-          for (const t of selectedTables) {
-            if (signal.aborted) {
-              send({ type: "aborted", message: "Migration aborted by user" });
-              close();
-              return;
-            }
-            const qn = `${t.schema}.${t.name}`;
-            const tableStart = Date.now();
-            send({ type: "table_start", table: qn });
+          const limit = pLimit(TABLE_CONCURRENCY);
+          await Promise.all(
+            selectedTables.map((t) =>
+              limit(async () => {
+                if (signal.aborted) return;
+                const qn = `${t.schema}.${t.name}`;
+                const tableStart = Date.now();
+                send({ type: "table_start", table: qn });
 
-            const dstClient = await dstPool.connect();
-            try {
-              await dstClient.query("BEGIN");
-              // Best-effort: skip FK + trigger enforcement during bulk load.
-              // Requires superuser (Supabase `postgres` role usually has it).
-              await dstClient
-                .query("SET LOCAL session_replication_role = 'replica'")
-                .catch(() => {});
+                const srcC = await srcDataPool.connect();
+                const dstC = await dstPool.connect();
+                try {
+                  await dstC.query("BEGIN");
+                  // Fix 7: session tuning. Best-effort; falls back silently if role lacks privilege.
+                  await dstC
+                    .query("SET LOCAL session_replication_role = 'replica'")
+                    .catch(() => {});
+                  await dstC.query("SET LOCAL synchronous_commit = OFF").catch(() => {});
 
-              if (config.conflictStrategy === "OVERWRITE") {
-                await dstClient.query(`TRUNCATE ${quoteQualified(t.schema, t.name)} RESTART IDENTITY CASCADE`);
-              }
+                  if (config.conflictStrategy === "OVERWRITE") {
+                    await dstC.query(
+                      `TRUNCATE ${quoteQualified(t.schema, t.name)} RESTART IDENTITY CASCADE`
+                    );
+                  }
 
-              const rowsCopied = await streamTable(
-                srcClient,
-                dstClient,
-                t,
-                config,
-                signal,
-                (n) => send({ type: "table_progress", table: qn, rowsCopied: n })
-              );
+                  const pk = pkMap.get(qn) ?? [];
+                  const rowsCopied = await streamTableViaCopy(
+                    srcC,
+                    dstC,
+                    t,
+                    config,
+                    pk,
+                    signal,
+                    makeThrottledProgress(send, qn)
+                  );
 
-              await dstClient.query("COMMIT");
-              totalRows += rowsCopied;
-              tablesDone += 1;
-              send({
-                type: "table_done",
-                table: qn,
-                rowsCopied,
-                durationMs: Date.now() - tableStart,
-              });
-            } catch (err: unknown) {
-              await dstClient.query("ROLLBACK").catch(() => {});
-              tablesFailed += 1;
-              const msg = err instanceof Error ? err.message : "Unknown error";
-              send({ type: "table_error", table: qn, error: msg });
-            } finally {
-              dstClient.release();
-            }
-          }
+                  await dstC.query("COMMIT");
+                  totalRows += rowsCopied;
+                  tablesDone += 1;
+                  // Final progress so UI lands on the exact row count.
+                  send({ type: "table_progress", table: qn, rowsCopied });
+                  send({
+                    type: "table_done",
+                    table: qn,
+                    rowsCopied,
+                    durationMs: Date.now() - tableStart,
+                  });
+                } catch (err: unknown) {
+                  await dstC.query("ROLLBACK").catch(() => {});
+                  if (err instanceof AbortError || signal.aborted) {
+                    send({ type: "log", message: `Aborted during ${qn}` });
+                  } else {
+                    tablesFailed += 1;
+                    const msg = err instanceof Error ? err.message : "Unknown error";
+                    send({ type: "table_error", table: qn, error: msg });
+                  }
+                } finally {
+                  srcC.release();
+                  dstC.release();
+                }
+              })
+            )
+          );
+          if (signal.aborted) throw new AbortError();
         }
 
         if (wantSchema && !config.tablesOnly) {
@@ -346,6 +378,7 @@ export async function POST(request: Request) {
       } finally {
         clearInterval(heartbeat);
         await srcClient.end().catch(() => {});
+        await srcDataPool.end().catch(() => {});
         await dstPool.end().catch(() => {});
         close();
       }
@@ -400,63 +433,105 @@ async function runDDL(
   }
 }
 
-async function streamTable(
-  srcClient: import("pg").Client,
-  dstClient: PoolClient,
+// Fix 6: throttle progress so we don't flood SSE on fast streams.
+function makeThrottledProgress(
+  send: (e: SSEEvent) => void,
+  qn: string
+): (rowsCopied: number) => void {
+  let lastEmit = 0;
+  return (rowsCopied: number) => {
+    const now = Date.now();
+    if (now - lastEmit >= PROGRESS_INTERVAL_MS) {
+      lastEmit = now;
+      send({ type: "table_progress", table: qn, rowsCopied });
+    }
+  };
+}
+
+// Fixes 1, 4, 5: stream the table via COPY TO STDOUT → COPY FROM STDIN.
+// No OFFSET pagination (server-side cursor inside COPY); no row-by-row INSERT; no buffering.
+// SKIP/UPSERT route through a TEMP staging table so ON CONFLICT can apply.
+async function streamTableViaCopy(
+  srcC: PoolClient,
+  dstC: PoolClient,
   t: TableInfo,
   config: MigrationConfig,
+  pk: string[],
   signal: AbortSignal,
   onProgress: (rowsCopied: number) => void
 ): Promise<number> {
-  const qn = `${t.schema}.${t.name}`;
-  const pk = await fetchPrimaryKey(srcClient, t.schema, t.name).catch(() => []);
-  const filter = config.rowFilters[qn];
+  const qn = quoteQualified(t.schema, t.name);
+  const cols = t.columns.map((c) => c.column_name);
+  const colList = cols.map(quoteIdent).join(", ");
+  const filter = config.rowFilters[`${t.schema}.${t.name}`];
 
-  const countSelect = `SELECT count(*)::bigint AS c FROM ${quoteQualified(t.schema, t.name)}${
-    filter?.whereClause ? ` WHERE ${filter.whereClause}` : ""
-  }${filter?.rowLimit ? ` LIMIT ${filter.rowLimit}` : ""}`;
+  let innerSelect = `SELECT ${colList} FROM ${qn}`;
+  if (filter?.whereClause && filter.whereClause.trim()) {
+    innerSelect += ` WHERE ${filter.whereClause}`;
+  }
+  if (filter?.rowLimit && filter.rowLimit > 0) {
+    innerSelect += ` LIMIT ${Math.floor(filter.rowLimit)}`;
+  }
+  const copyToSql = `COPY (${innerSelect}) TO STDOUT`;
 
-  let _unused: unknown = null;
-  _unused = countSelect;
-  void _unused;
+  const useStaging =
+    (config.conflictStrategy === "SKIP" || config.conflictStrategy === "UPSERT") && pk.length > 0;
+  let stagingIdent: string | null = null;
+  let copyFromSql: string;
 
-  const baseSelect = buildSelectSql(t, filter);
-  const batchSize = config.batchSize;
-  let offset = 0;
+  if (useStaging) {
+    const safeBase = t.name.replace(/[^a-zA-Z0-9_]/g, "_").slice(0, 40);
+    const rnd = Math.random().toString(36).slice(2, 8);
+    stagingIdent = quoteIdent(`_stg_${safeBase}_${rnd}`);
+    await dstC.query(`CREATE TEMP TABLE ${stagingIdent} (LIKE ${qn}) ON COMMIT DROP`);
+    copyFromSql = `COPY ${stagingIdent} (${colList}) FROM STDIN`;
+  } else {
+    // OVERWRITE (post-TRUNCATE) or no PK available: stream straight into target.
+    copyFromSql = `COPY ${qn} (${colList}) FROM STDIN`;
+  }
+
   let rowsCopied = 0;
-
-  for (;;) {
-    if (signal.aborted) throw new AbortError();
-    const pageSql = `${baseSelect} OFFSET ${offset} LIMIT ${batchSize}`;
-    const page = await srcClient.query<Record<string, unknown>>(pageSql);
-    if (page.rows.length === 0) break;
-
-    const insertSql = buildInsertSql(t, page.rows, config.conflictStrategy, pk);
-    if (insertSql) {
-      try {
-        await dstClient.query(insertSql);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (
-          (config.conflictStrategy === "SKIP" || config.conflictStrategy === "UPSERT") &&
-          msg.includes("no unique or exclusion constraint matching the ON CONFLICT specification")
-        ) {
-          // Fallback for targets missing PK/UNIQUE constraints: insert rows without ON CONFLICT.
-          const plainInsertSql = buildInsertSql(t, page.rows, "OVERWRITE", pk);
-          if (plainInsertSql) await dstClient.query(plainInsertSql);
-        } else {
-          throw err;
-        }
+  const counter = new Transform({
+    transform(chunk: Buffer, _enc, cb) {
+      // Postgres COPY text format: rows are separated by 0x0a. Binary data is hex-escaped
+      // and embedded newlines are escaped as "\n", so raw 0x0a bytes only appear at row ends.
+      for (let i = 0; i < chunk.length; i++) {
+        if (chunk[i] === 0x0a) rowsCopied += 1;
       }
-    }
+      onProgress(rowsCopied);
+      cb(null, chunk);
+    },
+  });
 
-    rowsCopied += page.rows.length;
-    onProgress(rowsCopied);
+  const reader = srcC.query(copyTo(copyToSql));
+  const writer = dstC.query(copyFrom(copyFromSql));
 
-    if (page.rows.length < batchSize) break;
-    offset += batchSize;
+  const onAbort = () => {
+    reader.destroy(new AbortError());
+    writer.destroy(new AbortError());
+  };
+  signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    await pipeline(reader, counter, writer);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
 
-    if (filter?.rowLimit && rowsCopied >= filter.rowLimit) break;
+  if (signal.aborted) throw new AbortError();
+
+  if (useStaging && stagingIdent) {
+    const pkCols = pk.map(quoteIdent).join(", ");
+    const updates = cols
+      .filter((c) => !pk.includes(c))
+      .map((c) => `${quoteIdent(c)} = EXCLUDED.${quoteIdent(c)}`)
+      .join(", ");
+    const conflictClause =
+      config.conflictStrategy === "SKIP" || !updates
+        ? `ON CONFLICT (${pkCols}) DO NOTHING`
+        : `ON CONFLICT (${pkCols}) DO UPDATE SET ${updates}`;
+    await dstC.query(
+      `INSERT INTO ${qn} (${colList}) SELECT ${colList} FROM ${stagingIdent} ${conflictClause}`
+    );
   }
 
   return rowsCopied;
