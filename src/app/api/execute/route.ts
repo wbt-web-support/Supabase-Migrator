@@ -7,19 +7,19 @@ import {
   buildCreateTableStatement,
   fetchExtensions,
   fetchEnums,
-  fetchForeignKeys,
+  fetchForeignKeysBatch,
   fetchFunctions,
-  fetchIndexes,
+  fetchIndexesBatch,
   fetchPrimaryKey,
-  fetchRlsPolicies,
+  fetchRlsPoliciesBatch,
   fetchSchema,
   fetchSequences,
-  fetchTriggers,
+  fetchTriggersBatch,
   fetchViews,
   filterTables,
 } from "@/lib/migration";
 import type { MigrationConfig, SSEEvent, TableInfo } from "@/lib/types";
-import type { PoolClient } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { from as copyFrom, to as copyTo } from "pg-copy-streams";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -28,6 +28,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const TABLE_CONCURRENCY = 6;
+const DDL_CONCURRENCY = 10;
 const SRC_POOL_SIZE = 10;
 const DST_POOL_SIZE = 20;
 const PROGRESS_INTERVAL_MS = 500;
@@ -181,20 +182,21 @@ export async function POST(request: Request) {
               if (seqs.length) send({ type: "log", message: `Sequences: ${ok}/${seqs.length} created` });
             }
 
-            if (config.objectTypes.tables) {
-              let ok = 0;
-              for (const t of selectedTables) {
-                const created = await runStmt(buildCreateTableStatement(t), `table ${t.schema}.${t.name}`);
-                const pk = pkMap.get(`${t.schema}.${t.name}`) ?? [];
-                if (pk.length) {
-                  const addPk = buildAddPrimaryKeyStatement(t.schema, t.name, pk);
-                  await runStmt(addPk, `primary key ${t.schema}.${t.name}`);
-                }
-                if (created) ok += 1;
-              }
-              send({ type: "log", message: `Tables: ${ok}/${selectedTables.length} created` });
-            }
           });
+
+          // Tables + primary keys: parallelized across the destination pool so 339
+          // tables don't serialize 339×2 round trips on one connection.
+          if (config.objectTypes.tables && selectedTables.length > 0) {
+            const ok = await runParallelTableDDL(
+              dstPool,
+              selectedTables,
+              pkMap,
+              DDL_CONCURRENCY,
+              signal,
+              send
+            );
+            send({ type: "log", message: `Tables: ${ok}/${selectedTables.length} created` });
+          }
         }
 
         let tablesDone = 0;
@@ -269,68 +271,90 @@ export async function POST(request: Request) {
         }
 
         if (wantSchema && !config.tablesOnly) {
-          await runDDL(dstPool, send, signal, async (runStmt) => {
-            if (config.objectTypes.indexes) {
-              let total = 0;
-              let ok = 0;
-              for (const t of selectedTables) {
-                const idx = await fetchIndexes(srcClient, t.schema, t.name).catch(() => []);
-                for (const stmt of idx) {
-                  total += 1;
-                  if (await runStmt(stmt, `index ${t.schema}.${t.name}`)) ok += 1;
-                }
-              }
-              send({ type: "log", message: `Indexes: ${ok}/${total} installed` });
-            }
-            if (config.objectTypes.foreignKeys) {
-              let total = 0;
-              let ok = 0;
-              for (const t of selectedTables) {
-                const fks = await fetchForeignKeys(srcClient, t.schema, t.name).catch(() => []);
-                for (const stmt of fks) {
-                  total += 1;
-                  if (await runStmt(stmt, `fk ${t.schema}.${t.name}`)) ok += 1;
-                }
-              }
-              send({ type: "log", message: `Foreign keys: ${ok}/${total} installed` });
-            }
-            if (config.objectTypes.views && selectedSchemas.length) {
-              const views = await fetchViews(srcClient, selectedSchemas).catch(() => []);
-              let ok = 0;
-              for (const stmt of views) if (await runStmt(stmt, "view")) ok += 1;
-              if (views.length) send({ type: "log", message: `Views: ${ok}/${views.length} created` });
-            }
-            if (config.objectTypes.functions && selectedSchemas.length) {
-              const fns = await fetchFunctions(srcClient, selectedSchemas).catch(() => []);
-              let ok = 0;
-              for (const stmt of fns) if (await runStmt(stmt, "function")) ok += 1;
-              if (fns.length) send({ type: "log", message: `Functions: ${ok}/${fns.length} created` });
-            }
-            if (config.objectTypes.triggers) {
-              let total = 0;
-              let ok = 0;
-              for (const t of selectedTables) {
-                const trigs = await fetchTriggers(srcClient, t.schema, t.name).catch(() => []);
-                for (const stmt of trigs) {
-                  total += 1;
-                  if (await runStmt(stmt, `trigger ${t.schema}.${t.name}`)) ok += 1;
-                }
-              }
-              send({ type: "log", message: `Triggers: ${ok}/${total} installed` });
-            }
-            if (config.objectTypes.rlsPolicies) {
-              let total = 0;
-              let ok = 0;
-              for (const t of selectedTables) {
-                const pols = await fetchRlsPolicies(srcClient, t.schema, t.name).catch(() => []);
-                for (const stmt of pols) {
-                  total += 1;
-                  if (await runStmt(stmt, `rls ${t.schema}.${t.name}`)) ok += 1;
-                }
-              }
-              send({ type: "log", message: `RLS: ${ok}/${total} applied` });
-            }
-          });
+          // Pre-fetch ALL per-table introspection in one round trip each, in parallel.
+          // Replaces N×4 sequential source queries with 4 batched ones.
+          const tableKeys = selectedTables.map((t) => ({ schema: t.schema, name: t.name }));
+          const [indexMap, fkMap, trigMap, rlsMap, viewsRes, fnsRes] = await Promise.all([
+            config.objectTypes.indexes
+              ? fetchIndexesBatch(srcClient, tableKeys).catch(() => new Map<string, string[]>())
+              : Promise.resolve(new Map<string, string[]>()),
+            config.objectTypes.foreignKeys
+              ? fetchForeignKeysBatch(srcClient, tableKeys).catch(() => new Map<string, string[]>())
+              : Promise.resolve(new Map<string, string[]>()),
+            config.objectTypes.triggers
+              ? fetchTriggersBatch(srcClient, tableKeys).catch(() => new Map<string, string[]>())
+              : Promise.resolve(new Map<string, string[]>()),
+            config.objectTypes.rlsPolicies
+              ? fetchRlsPoliciesBatch(srcClient, tableKeys).catch(() => new Map<string, string[]>())
+              : Promise.resolve(new Map<string, string[]>()),
+            config.objectTypes.views && selectedSchemas.length
+              ? fetchViews(srcClient, selectedSchemas).catch(() => [] as string[])
+              : Promise.resolve([] as string[]),
+            config.objectTypes.functions && selectedSchemas.length
+              ? fetchFunctions(srcClient, selectedSchemas).catch(() => [] as string[])
+              : Promise.resolve([] as string[]),
+          ]);
+
+          if (config.objectTypes.indexes) {
+            const [total, ok] = await runParallelStatements(
+              dstPool,
+              flattenMap(indexMap, "index"),
+              DDL_CONCURRENCY,
+              signal,
+              send
+            );
+            send({ type: "log", message: `Indexes: ${ok}/${total} installed` });
+          }
+          if (config.objectTypes.foreignKeys) {
+            const [total, ok] = await runParallelStatements(
+              dstPool,
+              flattenMap(fkMap, "fk"),
+              DDL_CONCURRENCY,
+              signal,
+              send
+            );
+            send({ type: "log", message: `Foreign keys: ${ok}/${total} installed` });
+          }
+          if (config.objectTypes.views && viewsRes.length) {
+            const [total, ok] = await runParallelStatements(
+              dstPool,
+              viewsRes.map((stmt) => ({ stmt, label: "view" })),
+              DDL_CONCURRENCY,
+              signal,
+              send
+            );
+            send({ type: "log", message: `Views: ${ok}/${total} created` });
+          }
+          if (config.objectTypes.functions && fnsRes.length) {
+            const [total, ok] = await runParallelStatements(
+              dstPool,
+              fnsRes.map((stmt) => ({ stmt, label: "function" })),
+              DDL_CONCURRENCY,
+              signal,
+              send
+            );
+            send({ type: "log", message: `Functions: ${ok}/${total} created` });
+          }
+          if (config.objectTypes.triggers) {
+            const [total, ok] = await runParallelStatements(
+              dstPool,
+              flattenMap(trigMap, "trigger"),
+              DDL_CONCURRENCY,
+              signal,
+              send
+            );
+            send({ type: "log", message: `Triggers: ${ok}/${total} installed` });
+          }
+          if (config.objectTypes.rlsPolicies) {
+            const [total, ok] = await runParallelStatements(
+              dstPool,
+              flattenMap(rlsMap, "rls"),
+              DDL_CONCURRENCY,
+              signal,
+              send
+            );
+            send({ type: "log", message: `RLS: ${ok}/${total} applied` });
+          }
         }
 
         if (config.objectTypes.storage) {
@@ -431,6 +455,99 @@ async function runDDL(
   } finally {
     c.release();
   }
+}
+
+// Parallel CREATE TABLE (+ primary key) across the destination pool.
+// Tables don't reference each other at creation time (FKs are added post-data),
+// so independent tables can be created concurrently.
+async function runParallelTableDDL(
+  dstPool: Pool,
+  selectedTables: TableInfo[],
+  pkMap: Map<string, string[]>,
+  concurrency: number,
+  signal: AbortSignal,
+  send: (e: SSEEvent) => void
+): Promise<number> {
+  const limit = pLimit(concurrency);
+  let ok = 0;
+  await Promise.all(
+    selectedTables.map((t) =>
+      limit(async () => {
+        if (signal.aborted) return;
+        const c = await dstPool.connect();
+        try {
+          const label = `table ${t.schema}.${t.name}`;
+          let createdOk = false;
+          try {
+            await c.query(buildCreateTableStatement(t));
+            createdOk = true;
+            ok += 1;
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : "unknown";
+            send({ type: "log", message: `DDL skip ${label}: ${msg}` });
+          }
+          const pk = pkMap.get(`${t.schema}.${t.name}`) ?? [];
+          if (createdOk && pk.length) {
+            try {
+              await c.query(buildAddPrimaryKeyStatement(t.schema, t.name, pk));
+            } catch (err: unknown) {
+              const msg = err instanceof Error ? err.message : "unknown";
+              send({
+                type: "log",
+                message: `DDL skip primary key ${t.schema}.${t.name}: ${msg}`,
+              });
+            }
+          }
+        } finally {
+          c.release();
+        }
+      })
+    )
+  );
+  return ok;
+}
+
+// Generic parallel DDL runner: runs each {stmt, label} across the pool, reports
+// per-statement errors as log events (non-fatal). Returns [total, okCount].
+async function runParallelStatements(
+  dstPool: Pool,
+  items: Array<{ stmt: string; label: string }>,
+  concurrency: number,
+  signal: AbortSignal,
+  send: (e: SSEEvent) => void
+): Promise<[number, number]> {
+  if (items.length === 0) return [0, 0];
+  const limit = pLimit(concurrency);
+  let ok = 0;
+  await Promise.all(
+    items.map((it) =>
+      limit(async () => {
+        if (signal.aborted) return;
+        const c = await dstPool.connect();
+        try {
+          await c.query(it.stmt);
+          ok += 1;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : "unknown";
+          send({ type: "log", message: `DDL skip ${it.label}: ${msg}` });
+        } finally {
+          c.release();
+        }
+      })
+    )
+  );
+  return [items.length, ok];
+}
+
+function flattenMap(
+  m: Map<string, string[]>,
+  kind: string
+): Array<{ stmt: string; label: string }> {
+  const out: Array<{ stmt: string; label: string }> = [];
+  for (const [qn, stmts] of m) {
+    for (const stmt of stmts) out.push({ stmt, label: `${kind} ${qn}` });
+  }
+  return out;
 }
 
 // Fix 6: throttle progress so we don't flood SSE on fast streams.

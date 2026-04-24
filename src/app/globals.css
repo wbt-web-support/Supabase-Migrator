@@ -144,3 +144,177 @@ body {
   overflow: auto;
   max-height: 60vh;
 }
+
+/* Preview generation loader */
+.preview-loader {
+  position: relative;
+  overflow: hidden;
+  padding: 3rem 2rem;
+}
+.preview-loader-bg {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(700px circle at 15% 20%, rgba(16, 185, 129, 0.10), transparent 60%),
+    radial-gradient(700px circle at 85% 80%, rgba(52, 211, 153, 0.08), transparent 60%);
+  pointer-events: none;
+  animation: preview-bg-drift 9s ease-in-out infinite alternate;
+}
+@keyframes preview-bg-drift {
+  from { transform: translate3d(0, 0, 0); }
+  to { transform: translate3d(-30px, 15px, 0); }
+}
+.preview-loader-content {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.25rem;
+}
+
+.preview-pipeline {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+}
+
+.preview-db {
+  position: relative;
+  width: 92px;
+  height: 112px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+.preview-db-svg {
+  width: 56px;
+  height: 70px;
+  stroke: var(--accent-2);
+  fill: rgba(16, 185, 129, 0.08);
+  stroke-width: 1.6;
+  filter: drop-shadow(0 0 10px rgba(16, 185, 129, 0.4));
+  z-index: 1;
+}
+.preview-db-ring {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 56px;
+  height: 70px;
+  border-radius: 50%;
+  border: 2px solid rgba(16, 185, 129, 0.45);
+  transform: translate(-50%, -50%);
+  animation: preview-db-ring 2.4s ease-out infinite;
+  pointer-events: none;
+}
+.preview-db-ring-delayed {
+  animation-delay: 1.2s;
+}
+@keyframes preview-db-ring {
+  0%   { transform: translate(-50%, -50%) scale(0.7); opacity: 0.8; }
+  100% { transform: translate(-50%, -50%) scale(1.8); opacity: 0; }
+}
+.preview-db-label {
+  position: absolute;
+  bottom: 4px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.preview-pipe {
+  position: relative;
+  width: 200px;
+  height: 3px;
+  background: linear-gradient(
+    to right,
+    rgba(16, 185, 129, 0.08),
+    rgba(16, 185, 129, 0.3),
+    rgba(16, 185, 129, 0.08)
+  );
+  border-radius: 2px;
+  box-shadow: 0 0 12px rgba(16, 185, 129, 0.15);
+}
+.preview-dot {
+  position: absolute;
+  top: -5px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow:
+    0 0 14px rgba(16, 185, 129, 0.9),
+    0 0 4px rgba(255, 255, 255, 0.7);
+  animation: preview-dot-flow 2.4s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+.preview-dot-1 { animation-delay: 0s; }
+.preview-dot-2 { animation-delay: 0.8s; }
+.preview-dot-3 { animation-delay: 1.6s; }
+@keyframes preview-dot-flow {
+  0%   { left: -6px;  opacity: 0; transform: scale(0.5); }
+  15%  { opacity: 1;  transform: scale(1); }
+  85%  { opacity: 1;  transform: scale(1); }
+  100% { left: calc(100% - 7px); opacity: 0; transform: scale(0.5); }
+}
+
+.preview-stage {
+  min-height: 1.4rem;
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: #e2e8f0;
+  text-align: center;
+  margin-top: 0.25rem;
+}
+.preview-stage-text {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 2px;
+  animation: preview-stage-in 420ms ease-out;
+}
+@keyframes preview-stage-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.preview-ellipsis {
+  display: inline-flex;
+  gap: 2px;
+  margin-left: 2px;
+}
+.preview-ellipsis > span {
+  animation: preview-ellipsis 1.4s ease-in-out infinite;
+  opacity: 0.25;
+}
+.preview-ellipsis > span:nth-child(2) { animation-delay: 0.2s; }
+.preview-ellipsis > span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes preview-ellipsis {
+  0%, 60%, 100% { opacity: 0.25; }
+  30%           { opacity: 1; }
+}
+
+.preview-elapsed {
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+  font-size: 0.72rem;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+}
+
+.preview-pips {
+  display: flex;
+  gap: 8px;
+  margin-top: 0.25rem;
+}
+.preview-pip {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #1f2937;
+  transition: transform 220ms, background 220ms, box-shadow 220ms;
+}
+.preview-pip-active {
+  background: var(--accent);
+  box-shadow: 0 0 10px rgba(16, 185, 129, 0.9);
+  transform: scale(1.35);
+}

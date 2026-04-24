@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Stepper } from "@/components/Stepper";
 import { SqlPreview } from "@/components/SqlPreview";
+import { PreviewLoader } from "@/components/PreviewLoader";
 import { useMigrator } from "@/components/MigratorProvider";
 import type { PreviewResponse } from "@/lib/types";
 
@@ -136,11 +137,7 @@ export default function PreviewPage() {
           </div>
         )}
 
-        {loading && (
-          <div className="sm-card p-6 text-center text-sm text-slate-400 mb-6">
-            Generating preview…
-          </div>
-        )}
+        {loading && <PreviewLoader />}
 
         {preview && (
           <>

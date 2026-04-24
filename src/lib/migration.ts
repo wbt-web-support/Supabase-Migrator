@@ -290,6 +290,200 @@ export function buildCreatePrimaryKeyStatement(schema: string, table: string, pk
   )} PRIMARY KEY (${pkColumns.map(quoteIdent).join(", ")});`;
 }
 
+// ─── Batched introspection (for preview) ─────────────────────────────────────
+// One round trip each instead of one-per-table. Uses parallel-array unnest
+// so we can pass (schema, table) pairs as two text[] params.
+
+type TableKey = { schema: string; name: string };
+
+function splitKeys(tables: TableKey[]): { schemas: string[]; names: string[] } {
+  return {
+    schemas: tables.map((t) => t.schema),
+    names: tables.map((t) => t.name),
+  };
+}
+
+function key(schema: string, name: string): string {
+  return `${schema}.${name}`;
+}
+
+export async function fetchIndexesBatch(
+  client: Client,
+  tables: TableKey[]
+): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>();
+  if (tables.length === 0) return out;
+  const { schemas, names } = splitKeys(tables);
+  const res = await client.query<{ schema: string; tbl: string; def: string }>(
+    `SELECT n.nspname AS schema, c.relname AS tbl,
+            pg_get_indexdef(i.indexrelid) || ';' AS def
+     FROM pg_index i
+     JOIN pg_class c ON c.oid = i.indrelid
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     JOIN pg_class idxcls ON idxcls.oid = i.indexrelid
+     LEFT JOIN pg_constraint con
+       ON con.conname = idxcls.relname
+      AND con.conrelid = i.indrelid
+      AND con.contype IN ('p','u')
+     WHERE (n.nspname, c.relname) IN (SELECT * FROM unnest($1::text[], $2::text[]))
+       AND con.oid IS NULL
+     ORDER BY n.nspname, c.relname, idxcls.relname`,
+    [schemas, names]
+  );
+  for (const r of res.rows) {
+    const k = key(r.schema, r.tbl);
+    const arr = out.get(k) ?? [];
+    arr.push(r.def);
+    out.set(k, arr);
+  }
+  return out;
+}
+
+export async function fetchForeignKeysBatch(
+  client: Client,
+  tables: TableKey[]
+): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>();
+  if (tables.length === 0) return out;
+  const { schemas, names } = splitKeys(tables);
+  const res = await client.query<{
+    schema: string;
+    tbl: string;
+    conname: string;
+    def: string;
+  }>(
+    `SELECT n.nspname AS schema, cl.relname AS tbl, c.conname,
+            pg_get_constraintdef(c.oid) AS def
+     FROM pg_constraint c
+     JOIN pg_class cl ON cl.oid = c.conrelid
+     JOIN pg_namespace n ON n.oid = cl.relnamespace
+     WHERE c.contype = 'f'
+       AND (n.nspname, cl.relname) IN (SELECT * FROM unnest($1::text[], $2::text[]))
+     ORDER BY n.nspname, cl.relname, c.conname`,
+    [schemas, names]
+  );
+  for (const r of res.rows) {
+    const k = key(r.schema, r.tbl);
+    const stmt = `ALTER TABLE ${quoteQualified(r.schema, r.tbl)} ADD CONSTRAINT ${quoteIdent(
+      r.conname
+    )} ${r.def};`;
+    const arr = out.get(k) ?? [];
+    arr.push(stmt);
+    out.set(k, arr);
+  }
+  return out;
+}
+
+export async function fetchTriggersBatch(
+  client: Client,
+  tables: TableKey[]
+): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>();
+  if (tables.length === 0) return out;
+  const { schemas, names } = splitKeys(tables);
+  const res = await client.query<{ schema: string; tbl: string; def: string }>(
+    `SELECT n.nspname AS schema, c.relname AS tbl,
+            pg_get_triggerdef(t.oid, true) || ';' AS def
+     FROM pg_trigger t
+     JOIN pg_class c ON c.oid = t.tgrelid
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE NOT t.tgisinternal
+       AND (n.nspname, c.relname) IN (SELECT * FROM unnest($1::text[], $2::text[]))
+     ORDER BY n.nspname, c.relname, t.tgname`,
+    [schemas, names]
+  );
+  for (const r of res.rows) {
+    const k = key(r.schema, r.tbl);
+    const arr = out.get(k) ?? [];
+    arr.push(r.def);
+    out.set(k, arr);
+  }
+  return out;
+}
+
+export async function fetchRlsPoliciesBatch(
+  client: Client,
+  tables: TableKey[]
+): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>();
+  if (tables.length === 0) return out;
+  const { schemas, names } = splitKeys(tables);
+
+  const [flagsRes, polsRes] = await Promise.all([
+    client.query<{ schema: string; tbl: string; rls_enabled: boolean; rls_forced: boolean }>(
+      `SELECT n.nspname AS schema, c.relname AS tbl,
+              c.relrowsecurity AS rls_enabled, c.relforcerowsecurity AS rls_forced
+       FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE (n.nspname, c.relname) IN (SELECT * FROM unnest($1::text[], $2::text[]))`,
+      [schemas, names]
+    ),
+    client.query<{ schema: string; tbl: string; stmt: string }>(
+      `SELECT n.nspname AS schema, c.relname AS tbl,
+         'CREATE POLICY ' || quote_ident(pol.polname) ||
+         ' ON ' || quote_ident(n.nspname) || '.' || quote_ident(c.relname) ||
+         CASE WHEN pol.polpermissive THEN ' AS PERMISSIVE' ELSE ' AS RESTRICTIVE' END ||
+         CASE pol.polcmd WHEN 'r' THEN ' FOR SELECT' WHEN 'a' THEN ' FOR INSERT'
+                         WHEN 'w' THEN ' FOR UPDATE' WHEN 'd' THEN ' FOR DELETE'
+                         WHEN '*' THEN ' FOR ALL' ELSE '' END ||
+         CASE WHEN pol.polroles <> '{0}'::oid[] THEN ' TO ' || array_to_string(
+           ARRAY(SELECT quote_ident(rolname) FROM pg_roles WHERE oid = ANY(pol.polroles)), ', ')
+           ELSE ' TO public' END ||
+         CASE WHEN pol.polqual IS NOT NULL
+           THEN ' USING (' || pg_get_expr(pol.polqual, pol.polrelid) || ')' ELSE '' END ||
+         CASE WHEN pol.polwithcheck IS NOT NULL
+           THEN ' WITH CHECK (' || pg_get_expr(pol.polwithcheck, pol.polrelid) || ')' ELSE '' END ||
+         ';' AS stmt
+       FROM pg_policy pol
+       JOIN pg_class c ON c.oid = pol.polrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE (n.nspname, c.relname) IN (SELECT * FROM unnest($1::text[], $2::text[]))
+       ORDER BY n.nspname, c.relname, pol.polname`,
+      [schemas, names]
+    ),
+  ]);
+
+  for (const r of flagsRes.rows) {
+    const k = key(r.schema, r.tbl);
+    const qn = quoteQualified(r.schema, r.tbl);
+    const lines: string[] = [];
+    if (r.rls_enabled) lines.push(`ALTER TABLE ${qn} ENABLE ROW LEVEL SECURITY;`);
+    if (r.rls_forced) lines.push(`ALTER TABLE ${qn} FORCE ROW LEVEL SECURITY;`);
+    if (lines.length) out.set(k, lines);
+  }
+  for (const r of polsRes.rows) {
+    const k = key(r.schema, r.tbl);
+    const arr = out.get(k) ?? [];
+    arr.push(r.stmt);
+    out.set(k, arr);
+  }
+  return out;
+}
+
+// Fast destination plan info: approximate row counts via pg_class.reltuples
+// (single query, milliseconds) instead of per-table `SELECT count(*)` full
+// table scans which could take minutes.
+export async function fetchDstPlanInfo(
+  client: Client,
+  tables: TableKey[]
+): Promise<Map<string, { approxRows: number }>> {
+  const out = new Map<string, { approxRows: number }>();
+  if (tables.length === 0) return out;
+  const { schemas, names } = splitKeys(tables);
+  const res = await client.query<{ schema: string; tbl: string; approx_rows: string | number }>(
+    `SELECT n.nspname AS schema, c.relname AS tbl, c.reltuples::bigint AS approx_rows
+     FROM pg_class c
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relkind = 'r'
+       AND (n.nspname, c.relname) IN (SELECT * FROM unnest($1::text[], $2::text[]))`,
+    [schemas, names]
+  );
+  for (const r of res.rows) {
+    out.set(key(r.schema, r.tbl), { approxRows: Math.max(0, Number(r.approx_rows ?? 0)) });
+  }
+  return out;
+}
+
 type PreviewOutput = {
   sql: string;
   plan: Array<{ qualifiedName: string; estimatedRows: number; sizeBytes: number; warnings: string[] }>;
@@ -308,6 +502,7 @@ export async function generatePreview(
 
   const selectedTables = filterTables(schema.tables, config);
   const selectedSchemas = Array.from(new Set(selectedTables.map((t) => t.schema)));
+  const tableKeys: TableKey[] = selectedTables.map((t) => ({ schema: t.schema, name: t.name }));
 
   parts.push(`-- Supabase Migrator generated SQL`);
   parts.push(`-- Scope: ${config.scopeMode}`);
@@ -317,34 +512,80 @@ export async function generatePreview(
   const wantSchema = config.scopeMode !== "data_only";
   const wantData = config.scopeMode !== "schema_only";
 
+  const wantExtensions = wantSchema && !config.tablesOnly && config.objectTypes.extensions;
+  const wantEnums = wantSchema && !config.tablesOnly && config.objectTypes.enums && selectedSchemas.length > 0;
+  const wantSequences =
+    wantSchema && !config.tablesOnly && config.objectTypes.sequences && selectedSchemas.length > 0;
+  const wantIndexes = wantSchema && !config.tablesOnly && config.objectTypes.indexes;
+  const wantForeignKeys = wantSchema && !config.tablesOnly && config.objectTypes.foreignKeys;
+  const wantViews = wantSchema && !config.tablesOnly && config.objectTypes.views && selectedSchemas.length > 0;
+  const wantFunctions =
+    wantSchema && !config.tablesOnly && config.objectTypes.functions && selectedSchemas.length > 0;
+  const wantTriggers = wantSchema && !config.tablesOnly && config.objectTypes.triggers;
+  const wantRls = wantSchema && !config.tablesOnly && config.objectTypes.rlsPolicies;
+
+  // All source introspection + destination plan info run in parallel.
+  // Source queries share one client (pg queues them), but destination queries
+  // hit a different client and truly run concurrently with source.
+  const [
+    extRes,
+    enumsRes,
+    seqsRes,
+    indexMap,
+    fkMap,
+    viewsRes,
+    fnsRes,
+    trigMap,
+    rlsMap,
+    dstInfoMap,
+  ] = await Promise.all([
+    wantExtensions ? fetchExtensions(srcClient).catch(() => [] as string[]) : Promise.resolve([] as string[]),
+    wantEnums
+      ? fetchEnums(srcClient, selectedSchemas).catch(() => [] as string[])
+      : Promise.resolve([] as string[]),
+    wantSequences
+      ? fetchSequences(srcClient, selectedSchemas).catch(() => [] as string[])
+      : Promise.resolve([] as string[]),
+    wantIndexes
+      ? fetchIndexesBatch(srcClient, tableKeys).catch(() => new Map<string, string[]>())
+      : Promise.resolve(new Map<string, string[]>()),
+    wantForeignKeys
+      ? fetchForeignKeysBatch(srcClient, tableKeys).catch(() => new Map<string, string[]>())
+      : Promise.resolve(new Map<string, string[]>()),
+    wantViews
+      ? fetchViews(srcClient, selectedSchemas).catch(() => [] as string[])
+      : Promise.resolve([] as string[]),
+    wantFunctions
+      ? fetchFunctions(srcClient, selectedSchemas).catch(() => [] as string[])
+      : Promise.resolve([] as string[]),
+    wantTriggers
+      ? fetchTriggersBatch(srcClient, tableKeys).catch(() => new Map<string, string[]>())
+      : Promise.resolve(new Map<string, string[]>()),
+    wantRls
+      ? fetchRlsPoliciesBatch(srcClient, tableKeys).catch(() => new Map<string, string[]>())
+      : Promise.resolve(new Map<string, string[]>()),
+    wantData
+      ? fetchDstPlanInfo(dstClient, tableKeys).catch(() => new Map<string, { approxRows: number }>())
+      : Promise.resolve(new Map<string, { approxRows: number }>()),
+  ]);
+
   if (wantSchema) {
     for (const s of selectedSchemas) {
       parts.push(`CREATE SCHEMA IF NOT EXISTS ${quoteIdent(s)};`);
     }
     parts.push("");
 
-    if (!config.tablesOnly && config.objectTypes.extensions) {
-      const ext = await fetchExtensions(srcClient).catch(() => []);
-      if (ext.length) {
-        parts.push("-- Extensions");
-        parts.push(...ext, "");
-      }
+    if (extRes.length) {
+      parts.push("-- Extensions");
+      parts.push(...extRes, "");
     }
-
-    if (!config.tablesOnly && config.objectTypes.enums && selectedSchemas.length) {
-      const enums = await fetchEnums(srcClient, selectedSchemas).catch(() => []);
-      if (enums.length) {
-        parts.push("-- Enums");
-        parts.push(...enums, "");
-      }
+    if (enumsRes.length) {
+      parts.push("-- Enums");
+      parts.push(...enumsRes, "");
     }
-
-    if (!config.tablesOnly && config.objectTypes.sequences && selectedSchemas.length) {
-      const seqs = await fetchSequences(srcClient, selectedSchemas).catch(() => []);
-      if (seqs.length) {
-        parts.push("-- Sequences");
-        parts.push(...seqs, "");
-      }
+    if (seqsRes.length) {
+      parts.push("-- Sequences");
+      parts.push(...seqsRes, "");
     }
 
     if (config.objectTypes.tables) {
@@ -355,11 +596,11 @@ export async function generatePreview(
       parts.push("");
     }
 
-    if (!config.tablesOnly && config.objectTypes.indexes) {
+    if (wantIndexes) {
       const allIdx: string[] = [];
       for (const t of selectedTables) {
-        const idx = await fetchIndexes(srcClient, t.schema, t.name).catch(() => []);
-        allIdx.push(...idx);
+        const idx = indexMap.get(`${t.schema}.${t.name}`);
+        if (idx?.length) allIdx.push(...idx);
       }
       if (allIdx.length) {
         parts.push("-- Indexes");
@@ -367,11 +608,11 @@ export async function generatePreview(
       }
     }
 
-    if (!config.tablesOnly && config.objectTypes.foreignKeys) {
+    if (wantForeignKeys) {
       const fks: string[] = [];
       for (const t of selectedTables) {
-        const items = await fetchForeignKeys(srcClient, t.schema, t.name).catch(() => []);
-        fks.push(...items);
+        const items = fkMap.get(`${t.schema}.${t.name}`);
+        if (items?.length) fks.push(...items);
       }
       if (fks.length) {
         parts.push("-- Foreign Keys");
@@ -379,27 +620,20 @@ export async function generatePreview(
       }
     }
 
-    if (!config.tablesOnly && config.objectTypes.views && selectedSchemas.length) {
-      const views = await fetchViews(srcClient, selectedSchemas).catch(() => []);
-      if (views.length) {
-        parts.push("-- Views");
-        parts.push(...views.map((v) => v + ";"), "");
-      }
+    if (viewsRes.length) {
+      parts.push("-- Views");
+      parts.push(...viewsRes.map((v) => v + ";"), "");
+    }
+    if (fnsRes.length) {
+      parts.push("-- Functions");
+      parts.push(...fnsRes, "");
     }
 
-    if (!config.tablesOnly && config.objectTypes.functions && selectedSchemas.length) {
-      const fns = await fetchFunctions(srcClient, selectedSchemas).catch(() => []);
-      if (fns.length) {
-        parts.push("-- Functions");
-        parts.push(...fns, "");
-      }
-    }
-
-    if (!config.tablesOnly && config.objectTypes.triggers) {
+    if (wantTriggers) {
       const trigs: string[] = [];
       for (const t of selectedTables) {
-        const items = await fetchTriggers(srcClient, t.schema, t.name).catch(() => []);
-        trigs.push(...items);
+        const items = trigMap.get(`${t.schema}.${t.name}`);
+        if (items?.length) trigs.push(...items);
       }
       if (trigs.length) {
         parts.push("-- Triggers");
@@ -407,11 +641,11 @@ export async function generatePreview(
       }
     }
 
-    if (!config.tablesOnly && config.objectTypes.rlsPolicies) {
+    if (wantRls) {
       const pols: string[] = [];
       for (const t of selectedTables) {
-        const items = await fetchRlsPolicies(srcClient, t.schema, t.name).catch(() => []);
-        pols.push(...items);
+        const items = rlsMap.get(`${t.schema}.${t.name}`);
+        if (items?.length) pols.push(...items);
       }
       if (pols.length) {
         parts.push("-- RLS Policies");
@@ -437,23 +671,11 @@ export async function generatePreview(
     const qn = `${t.schema}.${t.name}`;
     const w: string[] = [];
     if (wantData) {
-      const existsRes = await dstClient
-        .query<{ exists: boolean }>(
-          `SELECT EXISTS (
-             SELECT 1 FROM information_schema.tables
-             WHERE table_schema = $1 AND table_name = $2
-           ) AS exists`,
-          [t.schema, t.name]
-        )
-        .catch(() => ({ rows: [{ exists: false }] }));
-      if (existsRes.rows[0]?.exists) {
-        const countRes = await dstClient
-          .query<{ count: string }>(`SELECT count(*)::text AS count FROM ${quoteQualified(t.schema, t.name)}`)
-          .catch(() => ({ rows: [{ count: "0" }] }));
-        const cnt = Number(countRes.rows[0]?.count ?? 0);
-        if (cnt > 0) {
-          w.push(`Target already has ${cnt} rows — strategy: ${config.conflictStrategy}`);
-        }
+      const dstInfo = dstInfoMap.get(qn);
+      if (dstInfo && dstInfo.approxRows > 0) {
+        w.push(
+          `Target already has ~${dstInfo.approxRows.toLocaleString()} rows (estimate) — strategy: ${config.conflictStrategy}`
+        );
       }
     }
     plan.push({
