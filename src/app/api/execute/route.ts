@@ -358,29 +358,45 @@ export async function POST(request: Request) {
         }
 
         if (config.objectTypes.storage) {
-          if (
-            !source.projectUrl ||
-            !source.serviceRoleKey ||
-            !destination.projectUrl ||
-            !destination.serviceRoleKey
-          ) {
+          const srcUrl = source.projectUrl;
+          const srcKey = source.serviceRoleKey;
+          const dstUrl = destination.projectUrl;
+          const dstKey = destination.serviceRoleKey;
+
+          const missing: string[] = [];
+          if (!srcUrl) missing.push("source projectUrl");
+          if (!srcKey) missing.push("source serviceRoleKey");
+          if (!dstUrl) missing.push("destination projectUrl");
+          if (!dstKey) missing.push("destination serviceRoleKey");
+
+          if (!srcUrl || !srcKey || !dstUrl || !dstKey) {
             send({
               type: "log",
-              message: "Storage: skipped (missing project URL or service role key on source/destination)",
+              message: `Storage: SKIPPED — missing ${missing.join(
+                ", "
+              )}. To migrate storage buckets you must fill in Project URL + Service Role Key on BOTH source and destination in the connection form.`,
             });
           } else {
             send({ type: "log", message: "Storage: starting bucket/file sync…" });
-            const storageResult = await copySupabaseStorage({
-              sourceUrl: source.projectUrl,
-              sourceServiceKey: source.serviceRoleKey,
-              destinationUrl: destination.projectUrl,
-              destinationServiceKey: destination.serviceRoleKey,
-              onLog: (message) => send({ type: "log", message }),
-            });
-            send({
-              type: "log",
-              message: `Storage: done (${storageResult.buckets} buckets, ${storageResult.files} files synced)`,
-            });
+            try {
+              const storageResult = await copySupabaseStorage({
+                sourceUrl: srcUrl,
+                sourceServiceKey: srcKey,
+                destinationUrl: dstUrl,
+                destinationServiceKey: dstKey,
+                onLog: (message) => send({ type: "log", message }),
+              });
+              send({
+                type: "log",
+                message: `Storage: done — ${storageResult.buckets} bucket(s), ${storageResult.files} file(s) copied, ${storageResult.filesFailed} failed`,
+              });
+            } catch (err: unknown) {
+              const msg = err instanceof Error ? err.message : "unknown";
+              send({
+                type: "log",
+                message: `Storage: fatal — ${msg}. Database migration still completed.`,
+              });
+            }
           }
         }
 
